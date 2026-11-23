@@ -8,7 +8,7 @@ from dataclasses import asdict
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.staticfiles import StaticFiles
 
 from . import database as db
@@ -76,6 +76,17 @@ def _edge_dict(edge: OrderEdge) -> dict:
     }
 
 
+def _infeasible_response(exc: InfeasibleError, status_code: int) -> JSONResponse:
+    """把无解原因包装成 400/409。
+
+    ``detail`` 保持为可直接展示的中文说明（兼容既有前端与用例）；同时附带
+    ``period`` / ``remaining`` / ``blocking``，便于精确定位到节次、时刻和原表行。
+    """
+    body = {"detail": exc.reason}
+    body.update(exc.as_detail())
+    return JSONResponse(status_code=status_code, content=body)
+
+
 @app.post("/api/games")
 async def create_game(
     name: str = Form(...),
@@ -97,7 +108,7 @@ async def create_game(
         result = compute(starter_list, subs, scores, [])
     except InfeasibleError as exc:
         # 数据本身排不出合法顺序（如下场球员不在场）：拒绝入库并说明原因。
-        raise HTTPException(status_code=400, detail=exc.reason) from exc
+        return _infeasible_response(exc, 400)
 
     game_id = db.create_game(
         name=name,
@@ -224,7 +235,7 @@ def add_verification(
         outcome = db.add_verification(game_id, edge, note, compute)
     except InfeasibleError as exc:
         # 登记后排不出合法顺序：事务已回滚，已有核实与结果照旧。
-        raise HTTPException(status_code=409, detail=exc.reason) from exc
+        return _infeasible_response(exc, 409)
 
     return {
         "status": "ok",
@@ -233,9 +244,19 @@ def add_verification(
     }
 
 
+SAMPLE_FILES = (
+    "subs.csv",
+    "scores.csv",
+    "subs_dense.csv",
+    "scores_dense.csv",
+    "subs_scorer.csv",
+    "scores_scorer.csv",
+)
+
+
 @app.get("/samples/{filename}")
 def sample_file(filename: str):
-    if filename not in ("subs.csv", "scores.csv"):
+    if filename not in SAMPLE_FILES:
         raise HTTPException(status_code=404, detail="样例不存在")
     return FileResponse(os.path.join(SAMPLE_DIR, filename))
 

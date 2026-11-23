@@ -72,14 +72,29 @@ class GroupInfo:
 
 @dataclass
 class InfeasibleError(Exception):
-    """不存在满足全部规则与核实约束的合法交错顺序。"""
+    """不存在满足全部规则与核实约束的合法交错顺序。
+
+    ``period`` / ``remaining`` 指出出问题的节次与比赛时刻；``blocking`` 列出
+    造成阻塞的原表记录（``{"table": "sub"|"score", "row": 行号}``），便于页面
+    直接定位到 CSV 行。
+    """
 
     reason: str
     period: Optional[int] = None
     remaining: Optional[int] = None
+    blocking: list[dict] = field(default_factory=list)
 
     def __str__(self) -> str:  # pragma: no cover - 仅为调试
         return self.reason
+
+    def as_detail(self) -> dict:
+        """结构化的错误明细（供 API 返回，兼容旧的字符串 detail）。"""
+        return {
+            "reason": self.reason,
+            "period": self.period,
+            "remaining": self.remaining,
+            "blocking": list(self.blocking),
+        }
 
 
 WAY_CAP = 10_000_000
@@ -141,58 +156,242 @@ def _contradicting_edges(local_edges) -> Optional[tuple]:
     return None
 
 
-def _blocked_frontier_reason(
-    reachable: set[tuple[int, int]],
+def _requirements(
+    n_sub: int, n_score: int, local_edges
+) -> tuple[list[int], list[int]]:
+    """把组内先后约束压缩成每个事件的前置数量。
+
+    * ``score_need[i]``：执行第 i 笔换人前至少要完成的得分数；
+    * ``sub_need[j]``：执行第 j 笔得分前至少要完成的换人数。
+
+    同一时刻内换人与得分各自保持行序，所以"某笔得分先于换人 i"等价于
+    "换人 i 之前至少完成 a+1 笔得分"，取所有约束的最大值即可。
+    """
+    score_need = [0] * n_sub
+    sub_need = [0] * n_score
+    for ta, ia, tb, ib in local_edges:
+        if ta == "score" and tb == "sub":
+            if ia + 1 > score_need[ib]:
+                score_need[ib] = ia + 1
+        elif ta == "sub" and tb == "score":
+            if ia + 1 > sub_need[ib]:
+                sub_need[ib] = ia + 1
+    return score_need, sub_need
+
+
+def _transition_reasons(
+    i: int,
+    j: int,
     subs: list[SubEvent],
     scores: list[ScoreEvent],
-    local_edges,
+    score_need: list[int],
+    sub_need: list[int],
     courts: list[frozenset[str]],
-) -> str:
-    """在可达前沿找一个推进不了的事件并说明原因。"""
-    n_sub = len(subs)
-    for i, j in sorted(reachable):
-        if i < n_sub:
-            sub = subs[i]
-            if sub.outgoing not in courts[i]:
-                return (
-                    f"下场球员 {sub.outgoing}（换人 CSV 第 {sub.row_no} 行）"
-                    f"在该时刻已不在场上"
+) -> tuple[bool, bool, list[tuple[str, list[dict]]]]:
+    """返回 (换人边是否可走, 得分边是否可走, 被阻塞原因)。
+
+    原因以 ``(说明文字, 阻塞记录列表)`` 返回；每条阻塞记录为
+    ``{"table", "row"}``，直接对应原表行号。只检查与先后核实、得分者在场有关
+    的动态条件；换人本身的上下场合法性已由静态检查保证。
+    """
+    n_sub, n_score = len(subs), len(scores)
+    reasons: list[tuple[str, list[dict]]] = []
+    sub_ok = False
+    score_ok = False
+    if i < n_sub:
+        if j < score_need[i]:
+            a = score_need[i] - 1
+            reasons.append(
+                (
+                    f"核实要求得分 CSV 第 {scores[a].row_no} 行先于 "
+                    f"换人 CSV 第 {subs[i].row_no} 行，但该得分此前尚未发生",
+                    [
+                        {"table": "score", "row": scores[a].row_no},
+                        {"table": "sub", "row": subs[i].row_no},
+                    ],
                 )
-            if sub.incoming in courts[i]:
-                return (
-                    f"上场球员 {sub.incoming}（换人 CSV 第 {sub.row_no} 行）"
-                    f"在该时刻已在场上"
+            )
+        else:
+            sub_ok = True
+    if j < n_score:
+        sc = scores[j]
+        if i < sub_need[j]:
+            a = sub_need[j] - 1
+            reasons.append(
+                (
+                    f"核实要求换人 CSV 第 {subs[a].row_no} 行先于 "
+                    f"得分 CSV 第 {sc.row_no} 行，但该换人此前尚未发生",
+                    [
+                        {"table": "sub", "row": subs[a].row_no},
+                        {"table": "score", "row": sc.row_no},
+                    ],
                 )
-            for ta, ia, _tb, jb in local_edges:
-                # 要求得分 ia 先于换人 jb=i，而当前只完成了 j 笔得分。
-                if ta == "score" and jb == i and ia >= j:
-                    return (
-                        f"核实要求得分 CSV 第 {scores[ia].row_no} 行先于 "
-                        f"换人 CSV 第 {sub.row_no} 行，但该得分此前尚未发生"
-                    )
-        if j < len(scores):
-            sc = scores[j]
-            for ta, ia, _tb, jb in local_edges:
-                # 要求换人 ia 先于得分 jb=j，而当前只完成了 i 笔换人。
-                if ta == "sub" and jb == j and ia >= i:
-                    return (
-                        f"核实要求换人 CSV 第 {subs[ia].row_no} 行先于 "
-                        f"得分 CSV 第 {sc.row_no} 行，但该换人此前尚未发生"
-                    )
-            if sc.team == "own" and sc.scorer not in courts[i]:
-                return (
+            )
+        elif sc.team == "own" and sc.scorer not in courts[i]:
+            reasons.append(
+                (
                     f"本方得分者 {sc.scorer}（得分 CSV 第 {sc.row_no} 行）"
-                    f"在该时刻任何已构造的合法顺序中都无法处于场上"
+                    f"在该时刻任何已构造的合法顺序中都无法处于场上",
+                    [{"table": "score", "row": sc.row_no}],
                 )
-    return "换人与得分的先后约束相互矛盾，找不到合法交错顺序"
+            )
+        else:
+            score_ok = True
+    return sub_ok, score_ok, reasons
 
 
-def _apply_score(vec: dict[str, int], sc: ScoreEvent, court: frozenset[str]):
-    out = dict(vec)
-    delta = sc.points if sc.team == "own" else -sc.points
-    for p in court:
-        out[p] = out.get(p, 0) + delta
-    return out
+def _layer_dp(
+    n_sub: int,
+    n_score: int,
+    value_fn,
+    merge_fn,
+    add_fn,
+    init_value,
+    cap: Optional[int] = None,
+):
+    """沿 (已执行换人数 i, 已执行得分数 j) 逐层滚动。
+
+    ``value_fn(i, j)`` 返回 ``(换人边增量, 得分边增量)``，不可走的一边为
+    ``None``；``add_fn(value, delta)`` 把增量累加到状态值上；``merge_fn(old,
+    new)`` 合并同一目标状态的多个来源；``cap`` 给定时结果截断到该上限（用于数
+    顺序数）。
+
+    每层用紧凑数组按 ``i`` 连续存放，只保留当前层与下一层；状态数上限是
+    ``min(n_sub, n_score) + 1``，因此工作内存与换人数/得分数成线性关系。
+    返回 ``{i: value}``（仅含可达状态）。
+    """
+    lo = 0
+    values: list[object] = [init_value]
+    for total in range(n_sub + n_score):
+        next_lo = max(0, total + 1 - n_score)
+        next_hi = min(n_sub, total + 1)
+        nxt: list[object] = [None] * (next_hi - next_lo + 1)
+        for k, value in enumerate(values):
+            if value is None:
+                continue
+            i = lo + k
+            j = total - i
+            delta_sub, delta_score = value_fn(i, j)
+            if delta_sub is not None:
+                new = add_fn(value, delta_sub)
+                if cap is not None and new > cap:
+                    new = cap
+                idx = i + 1 - next_lo
+                old = nxt[idx]
+                nxt[idx] = new if old is None else merge_fn(old, new)
+            if delta_score is not None:
+                new = add_fn(value, delta_score)
+                if cap is not None and new > cap:
+                    new = cap
+                idx = i - next_lo
+                old = nxt[idx]
+                nxt[idx] = new if old is None else merge_fn(old, new)
+        if all(v is None for v in nxt):
+            return {}
+        lo = next_lo
+        values = nxt
+    return {lo + k: v for k, v in enumerate(values) if v is not None}
+
+
+def _count_ways(
+    subs: list[SubEvent],
+    scores: list[ScoreEvent],
+    score_need: list[int],
+    sub_need: list[int],
+    courts: list[frozenset[str]],
+) -> tuple[int, Optional[tuple[int, str, list[dict]]]]:
+    """统计合法交错顺序数（上限截断），并返回最早的阻塞层信息。"""
+    n_sub, n_score = len(subs), len(scores)
+    lo = 0
+    counts: list[int] = [1]
+    next_lo = 0
+    for total in range(n_sub + n_score):
+        next_lo = max(0, total + 1 - n_score)
+        next_hi = min(n_sub, total + 1)
+        nxt: list[int] = [0] * (next_hi - next_lo + 1)
+        for k, count in enumerate(counts):
+            if not count:
+                continue
+            i = lo + k
+            j = total - i
+            if i < n_sub and j >= score_need[i]:
+                idx = i + 1 - next_lo
+                nxt[idx] = min(WAY_CAP, nxt[idx] + count)
+            if j < n_score:
+                sc = scores[j]
+                if i >= sub_need[j] and (
+                    sc.team != "own" or sc.scorer in courts[i]
+                ):
+                    idx = i - next_lo
+                    nxt[idx] = min(WAY_CAP, nxt[idx] + count)
+        if not any(nxt):
+            # 该层所有可达状态都推进不了：收集原因供报错使用。
+            texts: list[str] = []
+            blocking: list[dict] = []
+            for k, count in enumerate(counts):
+                if not count:
+                    continue
+                i = lo + k
+                _, _, rs = _transition_reasons(
+                    i, total - i, subs, scores, score_need, sub_need, courts
+                )
+                for text, recs in rs:
+                    if text not in texts:
+                        texts.append(text)
+                    for rec in recs:
+                        if rec not in blocking:
+                            blocking.append(rec)
+            detail = "；".join(texts) or "换人与得分的先后约束相互矛盾"
+            return 0, (total, detail, blocking)
+        lo = next_lo
+        counts = nxt
+    final = counts[n_sub - lo] if 0 <= n_sub - lo < len(counts) else 0
+    return final, None
+
+
+def _merge_range(old, new):
+    return (min(old[0], new[0]), max(old[1], new[1]))
+
+
+def _add_range(value, delta):
+    return (value[0] + delta, value[1] + delta)
+
+
+def _player_range(
+    active: list[bool],
+    scores: list[ScoreEvent],
+    weighted: list[int],
+    score_need: list[int],
+    sub_need: list[int],
+    courts: list[frozenset[str]],
+) -> tuple[int, int]:
+    """给定球员的在场轨迹，求他在组内正负值的可达区间。
+
+    ``active[i]`` 表示执行完前 ``i`` 笔换人后他是否在场。工作内存为一层
+    ``{i: 区间}``，规模上限是 ``min(换人数, 得分数) + 1``，与球员数无关；
+    同组内多名球员共享同一条轨迹时只需算一次。整组都在场/都不在场直接取值。
+    """
+    if not any(active):
+        return (0, 0)
+    if all(active):
+        total = sum(weighted)
+        return (total, total)
+
+    n_sub, n_score = len(score_need), len(sub_need)
+
+    def value_fn(i, j):
+        sub_edge = 0 if (i < n_sub and j >= score_need[i]) else None
+        score_edge: object = None
+        if j < n_score and i >= sub_need[j]:
+            sc = scores[j]
+            if sc.team != "own" or sc.scorer in courts[i]:
+                score_edge = weighted[j] if active[i] else 0
+        return sub_edge, score_edge
+
+    final = _layer_dp(
+        n_sub, n_score, value_fn, _merge_range, _add_range, (0, 0)
+    )
+    return final.get(n_sub, (0, 0))
 
 
 def _solve_group(
@@ -205,7 +404,14 @@ def _solve_group(
     """求解单个时刻分组。
 
     返回 (组信息, {球员: (最小增量, 最大增量)})；无解时抛 InfeasibleError。
-    换人本身的合法性与交错顺序无关，先做静态检查。
+
+    换人本身的合法性与交错顺序无关，先做静态检查。组内求解分三步，任何一步
+    的工作内存都只与组内换人数、得分、核实及球员总数成线性关系：
+
+    1. 用 ``(i, j)`` 网格的滚动层统计合法交错顺序数（截断到 WAY_CAP）；
+    2. 对每名球员单独跑一次同样的滚动 DP，求其累计增量的最小/最大值。
+       同一状态里不再存放全部球员的向量，避免"状态数 × 球员数"的内存；
+    3. 无解时沿最早的阻塞层收集换人/得分原表行号与原因。
     """
     period, remaining = (
         (subs[0].period, subs[0].remaining)
@@ -220,11 +426,17 @@ def _solve_group(
         ta, ia, tb, ib = contradiction
         row_a = subs[ia].row_no if ta == "sub" else scores[ia].row_no
         row_b = subs[ib].row_no if tb == "sub" else scores[ib].row_no
+        label_a = "换人" if ta == "sub" else "得分"
+        label_b = "换人" if tb == "sub" else "得分"
         raise InfeasibleError(
-            f"第 {period} 节剩余 {remaining} 秒：换人/得分被同时登记了互斥的"
-            f"先后顺序（换人/得分 CSV 第 {row_a} 行与第 {row_b} 行）",
+            f"第 {period} 节剩余 {remaining} 秒：{label_a} CSV 第 {row_a} 行与"
+            f"{label_b} CSV 第 {row_b} 行被同时登记了互斥的先后顺序",
             period,
             remaining,
+            [
+                {"table": ta, "row": row_a},
+                {"table": tb, "row": row_b},
+            ],
         )
 
     # 静态检查换人：换人之间顺序固定，逐笔执行时上下场状态必须合法。
@@ -236,6 +448,7 @@ def _solve_group(
                 f"（换人 CSV 第 {ev.row_no} 行）此时不在场上",
                 period,
                 remaining,
+                [{"table": "sub", "row": ev.row_no}],
             )
         if ev.incoming in cur:
             raise InfeasibleError(
@@ -243,6 +456,7 @@ def _solve_group(
                 f"（换人 CSV 第 {ev.row_no} 行）此时已在场上",
                 period,
                 remaining,
+                [{"table": "sub", "row": ev.row_no}],
             )
         cur.discard(ev.outgoing)
         cur.add(ev.incoming)
@@ -255,83 +469,50 @@ def _solve_group(
         cur.add(ev.incoming)
         courts.append(frozenset(cur))
 
-    zero = {p: 0 for p in players}
-    # states[(i,j)] = (min 向量, max 向量)；键存在即状态可达。
-    states: dict[tuple[int, int], tuple[dict, dict]] = {
-        (0, 0): (dict(zero), dict(zero))
-    }
-    ways: dict[tuple[int, int], int] = defaultdict(int)
-    ways[(0, 0)] = 1
+    score_need, sub_need = _requirements(n_sub, n_score, local_edges)
+    weighted = [
+        (sc.points if sc.team == "own" else -sc.points) for sc in scores
+    ]
 
-    # 从已完成 total 个事件的状态推进到 total+1 个；最后一层（终点前）也要跑。
-    # i 的可行范围：0 <= i <= n_sub、0 <= j=total-i <= n_score。
-    for total in range(n_sub + n_score):
-        for i in range(max(0, total - n_score), min(n_sub, total) + 1):
-            j = total - i
-            if (i, j) not in states:
-                continue
-            min_v, max_v = states[(i, j)]
-            count = ways[(i, j)]
-
-            # 推进一笔换人 i。
-            if i < n_sub:
-                # ('score', ia, 'sub', i) 要求得分 ia 先于换人 i。
-                # 当前已完成 j 笔得分（下标 0..j-1），待执行的是第 j 笔。
-                # ia < j 才表示要求的得分已完成；ia == j 时若先换人，
-                # 待执行得分就被排到换人后面，违反约束，故 ia >= j 即阻塞。
-                blocked = any(
-                    ta == "score" and jb == i and ia >= j
-                    for ta, ia, _tb, jb in local_edges
-                )
-                if not blocked:
-                    key = (i + 1, j)
-                    ways[key] = min(WAY_CAP, ways[key] + count)
-                    if key in states:
-                        old_min, old_max = states[key]
-                        states[key] = (
-                            {p: min(old_min[p], min_v[p]) for p in players},
-                            {p: max(old_max[p], max_v[p]) for p in players},
-                        )
-                    else:
-                        states[key] = (dict(min_v), dict(max_v))
-
-            # 推进一笔得分 j。
-            if j < n_score:
-                sc = scores[j]
-                # ('sub', ia, 'score', j) 要求换人 ia 先于得分 j，
-                # 已完成 i 笔换人；ia >= i 说明要求的换人尚未完成，阻塞。
-                edge_blocked = any(
-                    ta == "sub" and jb == j and ia >= i
-                    for ta, ia, _tb, jb in local_edges
-                )
-                scorer_blocked = (
-                    sc.team == "own" and sc.scorer not in courts[i]
-                )
-                if not edge_blocked and not scorer_blocked:
-                    new_min = _apply_score(min_v, sc, courts[i])
-                    new_max = _apply_score(max_v, sc, courts[i])
-                    key = (i, j + 1)
-                    ways[key] = min(WAY_CAP, ways[key] + count)
-                    if key in states:
-                        old_min, old_max = states[key]
-                        states[key] = (
-                            {p: min(old_min[p], new_min[p]) for p in players},
-                            {p: max(old_max[p], new_max[p]) for p in players},
-                        )
-                    else:
-                        states[key] = (new_min, new_max)
-
-    final_key = (n_sub, n_score)
-    if final_key not in states:
-        reason = _blocked_frontier_reason(
-            set(states.keys()), subs, scores, local_edges, courts
-        )
+    legal_orders, blocked = _count_ways(
+        subs, scores, score_need, sub_need, courts
+    )
+    if blocked is not None:
+        layer, detail, blocking = blocked
         raise InfeasibleError(
-            f"第 {period} 节剩余 {remaining} 秒：{reason}", period, remaining
+            f"第 {period} 节剩余 {remaining} 秒：已合法推进 {layer} 个事件后，"
+            f"其余换人/得分无法继续，{detail}",
+            period,
+            remaining,
+            blocking,
         )
 
-    min_v, max_v = states[final_key]
-    legal_orders = ways[final_key]
+    # 每名球员的在场轨迹只由 (球员, i) 决定；轨迹相同的球员共享一次计算，
+    # 结果再回填给本组所有相关球员。按"是否首发 + 上下场事件序列"分组，避免
+    # 为每名球员物化整条轨迹——所有签名条目总数不超过 2×换人数。
+    changes_by_player: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for k, ev in enumerate(subs):
+        changes_by_player[ev.outgoing].append((k, -1))
+        changes_by_player[ev.incoming].append((k, 1))
+    deltas: dict[str, tuple[int, int]] = {}
+    by_pattern: dict[tuple, list[str]] = defaultdict(list)
+    for p in players:
+        by_pattern[(p in court, tuple(changes_by_player.get(p, ())))].append(p)
+    for group_players in by_pattern.values():
+        representative = group_players[0]
+        active = [representative in courts[0]]
+        on_court = active[0]
+        for ev in subs:
+            if ev.outgoing == representative:
+                on_court = False
+            elif ev.incoming == representative:
+                on_court = True
+            active.append(on_court)
+        value = _player_range(
+            active, scores, weighted, score_need, sub_need, courts
+        )
+        for p in group_players:
+            deltas[p] = value
     info = GroupInfo(
         period=period,
         remaining=remaining,
@@ -340,7 +521,7 @@ def _solve_group(
         legal_orders=legal_orders,
         ambiguous=(n_sub > 0 and n_score > 0 and legal_orders > 1),
     )
-    return info, {p: (min_v[p], max_v[p]) for p in players}
+    return info, deltas
 
 
 def compute(

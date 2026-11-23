@@ -241,7 +241,104 @@ def test_concurrent_conflicting_registration_preserves_consistency():
 
 
 def test_sample_files_served(client):
-    for name in ("subs.csv", "scores.csv"):
+    for name in (
+        "subs.csv",
+        "scores.csv",
+        "subs_dense.csv",
+        "scores_dense.csv",
+        "subs_scorer.csv",
+        "scores_scorer.csv",
+    ):
         resp = client.get(f"/samples/{name}")
         assert resp.status_code == 200
         assert resp.text.strip()
+    assert client.get("/samples/missing.csv").status_code == 404
+
+
+def test_dense_sample_upload_reports_capped_group_and_ranges(client):
+    """高密度同秒组：合法顺序多、区间精确，页面可用它演示内存与核实。"""
+    import pathlib
+
+    sample_dir = pathlib.Path(__file__).resolve().parent.parent / "samples"
+    subs = (sample_dir / "subs_dense.csv").read_bytes()
+    scores = (sample_dir / "scores_dense.csv").read_bytes()
+    resp = client.post(
+        "/api/games",
+        data={"name": "高密度", "starters": "A1,A2,A3,A4,A5"},
+        files={
+            "sub_file": ("subs_dense.csv", subs, "text/csv"),
+            "score_file": ("scores_dense.csv", scores, "text/csv"),
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    result = resp.json()["result"]
+    assert result["total_legal_orders"] == 14
+    assert result["ranges"]["A5"] == {"min": 0, "max": 0}
+    assert result["ranges"]["B2"] == {"min": 1, "max": 4}
+
+
+def test_infeasible_verification_reports_location_and_rows(client):
+    """新增核实导致无解：409 带节次、时刻、阻塞原表行号，且不落库。"""
+    subs_csv = (
+        "period,remaining,outgoing,incoming\n"
+        "1,600,A5,B1\n"
+    )
+    scores_csv = (
+        "period,remaining,team,points,scorer\n"
+        "1,600,own,2,B1\n"  # B1 必须先上场才能得分
+    )
+    gid = client.post(
+        "/api/games",
+        data={"name": "无解登记", "starters": "A1,A2,A3,A4,A5"},
+        files={
+            "sub_file": ("s.csv", subs_csv.encode(), "text/csv"),
+            "score_file": ("g.csv", scores_csv.encode(), "text/csv"),
+        },
+    ).json()["id"]
+    before = client.get(f"/api/games/{gid}").json()
+    assert before["result"]["total_legal_orders"] == 1
+
+    resp = client.post(
+        f"/api/games/{gid}/verifications",
+        json={
+            "period": 1, "remaining": 600,
+            "first_table": "score", "first_row": 1,
+            "second_table": "sub", "second_row": 1,
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body["period"] == 1 and body["remaining"] == 600
+    rows = {(b["table"], b["row"]) for b in body["blocking"]}
+    assert ("sub", 1) in rows
+    assert "第 1 节" in body["detail"] and "剩余 600 秒" in body["detail"]
+
+    after = client.get(f"/api/games/{gid}").json()
+    # 已提交的核实与统计保持不变（本次登记整体回滚，不留记录）。
+    assert after["verifications"] == before["verifications"] == []
+    assert after["result"]["ranges"] == before["result"]["ranges"]
+    assert after["result"]["total_legal_orders"] == 1
+
+
+def test_infeasible_upload_returns_structured_detail(client):
+    bad = client.post(
+        "/api/games",
+        data={"name": "上传无解", "starters": "A1,A2,A3,A4,A5"},
+        files={
+            "sub_file": (
+                "s.csv",
+                b"period,remaining,outgoing,incoming\n",
+                "text/csv",
+            ),
+            "score_file": (
+                "g.csv",
+                b"period,remaining,team,points,scorer\n1,600,own,2,X9\n",
+                "text/csv",
+            ),
+        },
+    )
+    assert bad.status_code == 400, bad.text
+    detail = bad.json()
+    assert detail["period"] == 1 and detail["remaining"] == 600
+    assert {"table": "score", "row": 1} in detail["blocking"]
+    assert "得分 CSV 第 1 行" in detail["detail"]

@@ -13,9 +13,29 @@ async function api(url, options) {
   if (!resp.ok) {
     const err = new Error(body.detail || `请求失败（${resp.status}）`);
     err.status = resp.status;
+    err.body = body;
     throw err;
   }
   return body;
+}
+
+function infeasibleText(err) {
+  // 400/409 的响应同时带有节次、时刻与阻塞的原表行号，拼成可读提示。
+  const body = err.body || {};
+  const parts = [err.message];
+  if (body.period !== null && body.period !== undefined) {
+    let where = `第 ${body.period} 节`;
+    if (body.remaining !== null && body.remaining !== undefined) {
+      where += `剩余 ${body.remaining} 秒`;
+    }
+    parts.push(`位置：${where}`);
+  }
+  if (Array.isArray(body.blocking) && body.blocking.length) {
+    const rows = body.blocking.map((b) =>
+      `${tableLabel(b.table)}第 ${b.row} 行`).join("、");
+    parts.push(`阻塞记录：${rows}`);
+  }
+  return parts.join("；");
 }
 
 function showMsg(el, text, ok) {
@@ -70,7 +90,31 @@ async function openGame(id) {
   renderTimeline(detail);
   renderEdges(detail.verifications);
   renderRanges(detail.result);
+  prefillVerifyForm(detail);
   document.getElementById("detail-card").scrollIntoView({ behavior: "smooth" });
+}
+
+function prefillVerifyForm(detail) {
+  // 默认填入第一个"同秒既有换人又有得分"的分组，减少网页演示时的输入。
+  const form = document.getElementById("verify-form");
+  const group = (detail.timeline || []).find(
+    (g) => g.subs.length && g.scores.length
+  );
+  if (!group) {
+    return;
+  }
+  if (!form.period.value) {
+    form.period.value = group.period;
+  }
+  if (!form.remaining.value) {
+    form.remaining.value = group.remaining;
+  }
+  if (!form.first_row.value) {
+    form.first_row.value = group.subs[0].row_no;
+  }
+  if (!form.second_row.value) {
+    form.second_row.value = group.scores[0].row_no;
+  }
 }
 
 function renderTimeline(detail) {
@@ -157,26 +201,55 @@ document.getElementById("upload-form").addEventListener("submit", async (e) => {
     await loadGames();
     await openGame(body.id);
   } catch (err) {
-    showMsg(msg, `上传被拒绝：${err.message}`, false);
+    showMsg(msg, `上传被拒绝：${infeasibleText(err)}`, false);
   }
 });
 
 // ---------- 样例数据 ----------
 
-document.getElementById("load-sample").addEventListener("click", async () => {
-  const form = document.getElementById("upload-form");
-  const [subResp, scoreResp] = await Promise.all([
-    fetch("/samples/subs.csv"),
-    fetch("/samples/scores.csv"),
-  ]);
-  const subText = await subResp.text();
-  const scoreText = await scoreResp.text();
-  form.elements.name.value = "样例比赛：同秒换人复核";
-  form.elements.starters.value = "A1,A2,A3,A4,A5";
-  form.elements.sub_file.files = makeFileList(sampleFile(subText, "subs.csv"));
-  form.elements.score_file.files = makeFileList(sampleFile(scoreText, "scores.csv"));
-  showMsg(document.getElementById("upload-msg"), "样例已载入表单，点击“上传并计算”。", true);
-});
+const SAMPLE_SETS = {
+  basic: {
+    name: "样例比赛：同秒换人复核",
+    subs: "/samples/subs.csv",
+    scores: "/samples/scores.csv",
+  },
+  dense: {
+    name: "高密度样例：同秒 3 换人 + 4 得分",
+    subs: "/samples/subs_dense.csv",
+    scores: "/samples/scores_dense.csv",
+  },
+  scorer: {
+    name: "录像核实样例：得分者后上场",
+    subs: "/samples/subs_scorer.csv",
+    scores: "/samples/scores_scorer.csv",
+  },
+};
+
+for (const button of document.querySelectorAll(".load-sample")) {
+  button.addEventListener("click", async () => {
+    const sample = SAMPLE_SETS[button.dataset.dataset] || SAMPLE_SETS.basic;
+    const form = document.getElementById("upload-form");
+    const [subResp, scoreResp] = await Promise.all([
+      fetch(sample.subs),
+      fetch(sample.scores),
+    ]);
+    const subText = await subResp.text();
+    const scoreText = await scoreResp.text();
+    form.elements.name.value = sample.name;
+    form.elements.starters.value = "A1,A2,A3,A4,A5";
+    form.elements.sub_file.files = makeFileList(
+      sampleFile(subText, sample.subs.split("/").pop())
+    );
+    form.elements.score_file.files = makeFileList(
+      sampleFile(scoreText, sample.scores.split("/").pop())
+    );
+    showMsg(
+      document.getElementById("upload-msg"),
+      `已载入「${sample.name}」，点击“上传并计算”。`,
+      true
+    );
+  });
+}
 
 function sampleFile(text, name) {
   return new File([text], name, { type: "text/csv" });
@@ -226,8 +299,8 @@ document.getElementById("verify-form").addEventListener("submit", async (e) => {
     showMsg(
       msg,
       err.status === 409
-        ? `登记被拒绝（已有记录与结果保持不变）：${err.message}`
-        : `提交失败：${err.message}`,
+        ? `登记被拒绝（已有记录与结果保持不变）：${infeasibleText(err)}`
+        : `提交失败：${infeasibleText(err)}`,
       false
     );
   }

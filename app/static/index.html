@@ -35,14 +35,20 @@
         </div>
         <div class="actions">
           <button type="submit">上传并计算</button>
-          <button type="button" id="load-sample">载入样例数据</button>
+          <button type="button" class="load-sample" data-dataset="basic">载入样例数据</button>
+          <button type="button" class="load-sample" data-dataset="dense">载入高密度样例</button>
+          <button type="button" class="load-sample" data-dataset="scorer">载入录像核实样例</button>
         </div>
         <p class="hint">
           表头：换人表 <code>period,remaining,outgoing,incoming</code>；
           得分表 <code>period,remaining,team,points,scorer</code>（team 取
           <code>own/opp</code> 或 <code>本方/对方</code>）。
           <a href="/samples/subs.csv">下载换人样例</a> ·
-          <a href="/samples/scores.csv">下载得分样例</a>
+          <a href="/samples/scores.csv">下载得分样例</a> ·
+          <a href="/samples/subs_dense.csv">高密度换人</a> ·
+          <a href="/samples/scores_dense.csv">高密度得分</a> ·
+          <a href="/samples/subs_scorer.csv">录像核实换人</a> ·
+          <a href="/samples/scores_scorer.csv">录像核实得分</a>
         </p>
       </form>
       <div id="upload-msg" class="msg"></div>

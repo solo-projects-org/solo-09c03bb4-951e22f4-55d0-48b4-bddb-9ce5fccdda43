@@ -194,3 +194,97 @@ def test_two_subs_one_score_unique_order_when_scorer_enters_late():
 def test_starters_must_be_five_distinct():
     with pytest.raises(ValueError):
         compute(["A1", "A2", "A3", "A4", "A4"], [], [], [])
+
+
+def test_ranges_exact_when_legal_orders_hit_cap():
+    """合法顺序数达到显示上限被截断时，每名球员的区间仍须精确。"""
+    from app.engine import WAY_CAP
+
+    subs = []
+    on = ["A2", "A3", "A4", "A5"]
+    for k in range(30):
+        incoming = f"B{k + 1}"
+        outgoing = on.pop(0)
+        subs.append(sub(1, 600, outgoing, incoming, k + 1))
+        on.append(incoming)
+    scores = [score(1, 600, "own", 1, "A1", k + 1) for k in range(30)]
+
+    result = compute(STARTERS, subs, scores, [])
+    assert result["total_legal_orders"] == WAY_CAP
+    # A1 整组都在场：精确拿到全部 30 分。
+    assert result["ranges"]["A1"] == {"min": 30, "max": 30}
+    # 第一名替补 B1 在 30 种换人位置中的任意一处登场，得分可能全拿也可能全丢。
+    assert result["ranges"]["B1"] == {"min": 0, "max": 30}
+    # 最后登场的 B30 也只能在最后一笔换人后接住任意数量的得分。
+    assert result["ranges"]["B30"] == {"min": 0, "max": 30}
+
+
+def test_group_working_memory_grows_linearly(tmp_path):
+    """同秒组的工作内存随换人/得分/球员总数线性增长，而非状态×球员。"""
+    import gc
+    import tracemalloc
+
+    from app.engine import _solve_group
+
+    def one_group(n_sub, n_score, n_players):
+        subs = []
+        on = ["A2", "A3", "A4", "A5"]
+        bench = []
+        for k in range(n_sub):
+            incoming = f"B{k + 1}"
+            outgoing = on.pop(0)
+            subs.append(sub(1, 100, outgoing, incoming, k + 1))
+            on.append(incoming)
+            bench.append(incoming)
+        scores = [score(1, 100, "own", 1, "A1", k + 1) for k in range(n_score)]
+        players = sorted(set(STARTERS) | set(bench))
+        players += [f"Z{k}" for k in range(max(0, n_players - len(players)))]
+        return subs, scores, players
+
+    def peak(n_sub, n_score, n_players):
+        subs, scores, players = one_group(n_sub, n_score, n_players)
+        gc.collect()
+        tracemalloc.start()
+        try:
+            _solve_group(subs, scores, [], frozenset(STARTERS), players)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    small = peak(30, 30, 14)
+    big = peak(80, 80, 38)
+    # 事件数、球员数同步放大，峰值内存不应按乘积规模爆炸式增长。
+    # 实测约 41 KiB -> 99 KiB（2.4 倍）；旧实现同规模约 21 MiB。
+    assert big < 400_000, big
+    assert big < small * 4, (small, big)
+
+    # 固定事件数时，球员数增加对峰值几乎没有影响（不再存"状态×球员"向量）。
+    p14 = peak(30, 30, 14)
+    p140 = peak(30, 30, 140)
+    assert p140 < p14 * 2 + 50_000, (p14, p140)
+
+
+def test_infeasible_error_exposes_period_time_and_rows():
+    subs = [sub(2, 420, "A5", "B1", 7)]
+    scores = [score(2, 420, "own", 2, "B2", 9)]
+    with pytest.raises(InfeasibleError) as exc:
+        compute(STARTERS, subs, scores, [])
+    err = exc.value
+    assert err.period == 2 and err.remaining == 420
+    assert {"table": "score", "row": 9} in err.blocking
+    detail = err.as_detail()
+    assert detail["period"] == 2 and detail["remaining"] == 420
+
+
+def test_infeasible_verification_reports_both_source_rows():
+    # B1 只有先换人才能上场得分；核实却要求该得分先于换人 -> 无解。
+    subs = [sub(1, 600, "A5", "B1", 3)]
+    scores = [score(1, 600, "own", 2, "B1", 8)]
+    edges = [OrderEdge(1, 600, "score", 8, "sub", 3)]
+    with pytest.raises(InfeasibleError) as exc:
+        compute(STARTERS, subs, scores, edges)
+    err = exc.value
+    assert err.period == 1 and err.remaining == 600
+    rows = {(b["table"], b["row"]) for b in err.blocking}
+    assert ("sub", 3) in rows
+    assert "核实要求" in err.reason
